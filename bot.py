@@ -4,13 +4,14 @@ import asyncio
 import time
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus
 
 import aiohttp
 import discord
 from discord import app_commands
 
 
-print("MediaDB code version: 1.6.8")
+print("MediaDB code version: 1.6.10")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -726,6 +727,52 @@ def unix_to_date_string(
     ).strftime(
         "%Y-%m-%d"
     )
+
+
+def format_game_release_date(
+    timestamp: int
+) -> str:
+
+    if not timestamp:
+        return "Date unavailable"
+
+    release_date = datetime.fromtimestamp(
+        int(timestamp),
+        tz=timezone.utc
+    )
+
+    return release_date.strftime(
+        "%B %d, %Y"
+    ).replace(" 0", " ")
+
+
+def format_game_date_countdown(
+    timestamp: int
+) -> str:
+
+    if not timestamp:
+        return "Date unavailable"
+
+    release_date = datetime.fromtimestamp(
+        int(timestamp),
+        tz=timezone.utc
+    ).date()
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
+
+    days_remaining = (
+        release_date - today
+    ).days
+
+    if days_remaining < 0:
+        return "Released"
+
+    if days_remaining == 0:
+        return "Today"
+
+    return f"{days_remaining}d"
 
 
 def format_countdown(
@@ -2727,15 +2774,11 @@ async def build_game_upcoming_embed(
         ]
     )
 
-    date_string = unix_to_date_string(
-        release_timestamp
-    )
-
     description = (
         f"{metadata}\n\n"
         f"{summary}\n\n"
-        f"\U0001f4c5 **{format_unix_date(release_timestamp)}**\n"
-        f"\U000023f3 **{format_countdown(date_string)}**\n"
+        f"\U0001f4c5 **{format_game_release_date(release_timestamp)}**\n"
+        f"\U000023f3 **{format_game_date_countdown(release_timestamp)}**\n"
         f"{game_score_meter(game)}"
     )
 
@@ -4881,68 +4924,58 @@ async def direct_hltb_search(title: str) -> list[dict]:
 
 @client.tree.command(
     name="howlong",
-    description="See how long a game takes to beat."
+    description="Open a game's HowLongToBeat page."
 )
 @app_commands.describe(game="Game title to search for.")
 async def howlong(interaction: discord.Interaction, game: str):
     await interaction.response.defer()
 
-    variants = expand_game_query(game)
-    search_query = variants[-1] if variants else game
-
     try:
-        results = await direct_hltb_search(search_query)
+        results = await search_games(game)
     except Exception as error:
-        print(f"HowLongToBeat direct search error: {error}")
+        print(f"IGDB /howlong title lookup error: {error}")
         await interaction.followup.send(
-            "MediaDB couldn't reach HowLongToBeat right now."
+            "MediaDB couldn't resolve that game title right now."
         )
         return
 
     if not results:
         await interaction.followup.send(
-            f"No HowLongToBeat result was found for **{game}**."
+            f"No relevant game result was found for **{game}**."
         )
         return
 
-    result = max(
-        results,
-        key=lambda entry: game_title_match_score(
-            game,
-            entry.get("game_name") or ""
-        )
+    resolved_game = results[0]
+    resolved_title = resolved_game.get("name") or game
+
+    hltb_url = (
+        f"https://howlongtobeat.com/?q="
+        f"{quote_plus(resolved_title)}"
     )
 
+    platform_text = format_game_platforms(resolved_game)
+
     embed = discord.Embed(
-        title=result.get("game_name") or game,
-        url=result.get("game_web_link") or None,
+        title=resolved_title,
+        url=hltb_url,
         description=(
-            f"\U0001f3ae **"
-            f"{format_hltb_platforms(result.get('profile_platforms'))}**"
+            f"\U0001f3ae **{platform_text}**\n\n"
+            f"\U0001f517 **[View on HowLongToBeat]({hltb_url})**"
         ),
         color=discord.Color.from_rgb(40, 105, 150)
     )
 
-    embed.add_field(
-        name="\U0001f4d6 Main Story",
-        value=f"**{format_hltb_hours(result.get('main_story'))}**",
-        inline=False
-    )
-    embed.add_field(
-        name="\U00002728 Main Story + Extras",
-        value=f"**{format_hltb_hours(result.get('main_extra'))}**",
-        inline=False
-    )
-    embed.add_field(
-        name="\U0001f3c6 Completionist",
-        value=f"**{format_hltb_hours(result.get('completionist'))}**",
-        inline=False
+    cover_url = igdb_cover_url(
+        resolved_game,
+        thumbnail=True
     )
 
-    if result.get("game_image_url"):
-        embed.set_thumbnail(url=result["game_image_url"])
+    if cover_url:
+        embed.set_thumbnail(url=cover_url)
 
-    embed.set_footer(text="Playtime data provided by HowLongToBeat")
+    embed.set_footer(
+        text="Game title provided by IGDB"
+    )
 
     await interaction.followup.send(embed=embed)
 
