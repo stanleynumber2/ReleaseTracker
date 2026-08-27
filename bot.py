@@ -8,12 +8,11 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 import discord
 from discord import app_commands
-from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.6.7")
+print("MediaDB code version: 1.6.8")
 
-# 1.6.4 is based on the known-good 1.6.3 command/data logic.
+# 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
 # Autocomplete never contacts IGDB; IGDB is only contacted when a command runs.
 
@@ -969,9 +968,6 @@ ROMAN_NUMERALS = {
     "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19, "xx": 20,
 }
 
-# Small franchise expansions handle shorthand that no generic matcher can
-# reverse on its own (for example, "ff" -> "Final Fantasy"). Everything
-# after expansion is ranked generically.
 GAME_ABBREVIATIONS = {
     "ff": "final fantasy",
     "gta": "grand theft auto",
@@ -991,7 +987,6 @@ SEARCH_NOISE_WORDS = {
 
 
 def _split_compact_token(token: str) -> list[str]:
-    # ff7 -> ff + 7, gta5 -> gta + 5, re4 -> re + 4
     match = re.fullmatch(r"([a-z]+)(\d+)", token)
     if match:
         return [match.group(1), match.group(2)]
@@ -1022,7 +1017,6 @@ def normalize_title(
 
 
 def expand_game_query(text: str) -> list[str]:
-    """Return original + generic shorthand expansions, deduplicated."""
     normalized = normalize_title(text)
     tokens = normalized.split()
 
@@ -1043,7 +1037,6 @@ def expand_game_query(text: str) -> list[str]:
         if changed:
             variants.append(" ".join(expanded_tokens))
 
-    # Keep order, remove empty/duplicate variants.
     seen = set()
     final = []
     for variant in variants:
@@ -1074,12 +1067,10 @@ def _title_acronym_variants(text: str) -> set[str]:
         else:
             parts.append(token[0])
 
-    # Prefix variants let "ff7" match "Final Fantasy VII Remake" (ff7r).
     return {"".join(parts[:i]) for i in range(2, len(parts) + 1)}
 
 
 def game_title_match_score(query: str, candidate: str) -> float:
-    """Higher is better. Handles punctuation, numerals, tokens and acronyms."""
     query_norm = normalize_title(query)
     candidate_norm = normalize_title(candidate)
 
@@ -1103,18 +1094,9 @@ def game_title_match_score(query: str, candidate: str) -> float:
         overlap = len(query_tokens & candidate_tokens) / len(query_tokens)
         score += overlap * 180
 
-    compact_query_tokens = {
-        token for token in query_tokens
-        if re.fullmatch(r"[a-z]+\d+|[a-z]{2,5}", token)
-    }
+    compact_query = "".join(_title_tokens(query))
     candidate_acronyms = _title_acronym_variants(candidate)
 
-    for compact in compact_query_tokens:
-        # Rejoin split shorthand where useful: "ff 7" -> "ff7".
-        if compact in candidate_acronyms:
-            score += 250
-
-    compact_query = "".join(_title_tokens(query))
     if compact_query in candidate_acronyms:
         score += 300
 
@@ -1215,7 +1197,6 @@ def game_search_relevance(
         or 0
     )
 
-    # Sort ascending: strongest text match first, popularity as tie-breaker.
     return (
         -match_score,
         -rating_count
@@ -1588,8 +1569,6 @@ async def search_games(
         "url"
     )
 
-    # Search the user's wording plus any generic shorthand expansion.
-    # Results are merged by IGDB id and ranked locally afterward.
     merged = {}
 
     for query_variant in expand_game_query(title):
@@ -4551,31 +4530,349 @@ async def countdown(
 
 
 # =========================================================
-# HOWLONGTOBEAT
+# HOWLONGTOBEAT - DIRECT WEBSITE SEARCH
 # =========================================================
+
+HLTB_BASE_URL = "https://howlongtobeat.com"
+HLTB_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/91.0.4472.124 Safari/537.36"
+)
+
+_hltb_search_endpoint = None
+_hltb_search_user_id = None
+
 
 def format_hltb_hours(value) -> str:
     if value is None:
         return "No data"
+
     try:
         hours = float(value)
     except (TypeError, ValueError):
         return "No data"
+
     if hours <= 0:
         return "No data"
+
     if hours.is_integer():
         return f"{int(hours)} hrs"
+
     return f"{hours:.1f} hrs"
 
 
 def format_hltb_platforms(platforms) -> str:
     if not platforms:
         return "Platforms unavailable"
+
+    if isinstance(platforms, str):
+        platforms = [
+            item.strip()
+            for item in platforms.split(",")
+            if item.strip()
+        ]
+
     if isinstance(platforms, (list, tuple, set)):
-        text = " \U00002022 ".join(str(platform) for platform in platforms if platform)
+        text = " \U00002022 ".join(
+            str(platform)
+            for platform in platforms
+            if platform
+        )
     else:
         text = str(platforms)
+
     return text or "Platforms unavailable"
+
+
+def hltb_seconds_to_hours(value):
+    try:
+        seconds = float(value or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if seconds <= 0:
+        return None
+
+    return seconds / 3600
+
+
+def hltb_headers(auth: dict | None = None) -> dict:
+    headers = {
+        "User-Agent": HLTB_USER_AGENT,
+        "Referer": HLTB_BASE_URL,
+        "Origin": HLTB_BASE_URL,
+        "Accept": "*/*",
+    }
+
+    if auth:
+        headers["Content-Type"] = "application/json"
+
+        if auth.get("token"):
+            headers["x-auth-token"] = str(auth["token"])
+        if auth.get("key"):
+            headers["x-hp-key"] = str(auth["key"])
+        if auth.get("value"):
+            headers["x-hp-val"] = str(auth["value"])
+
+    return headers
+
+
+async def discover_hltb_search_info() -> tuple[str, str | None]:
+    global _hltb_search_endpoint
+    global _hltb_search_user_id
+
+    if _hltb_search_endpoint:
+        return _hltb_search_endpoint, _hltb_search_user_id
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(
+                HLTB_BASE_URL,
+                headers=hltb_headers()
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(
+                        f"HLTB homepage returned HTTP {response.status}"
+                    )
+
+                homepage = await response.text()
+
+            script_paths = re.findall(
+                r'<script[^>]+src=["\']([^"\']+)["\']',
+                homepage,
+                flags=re.IGNORECASE
+            )
+
+            for script_path in script_paths[:40]:
+                script_url = (
+                    script_path
+                    if script_path.startswith("http")
+                    else f"{HLTB_BASE_URL}{script_path}"
+                )
+
+                try:
+                    async with session.get(
+                        script_url,
+                        headers=hltb_headers()
+                    ) as script_response:
+                        if script_response.status != 200:
+                            continue
+
+                        script = await script_response.text()
+                except Exception:
+                    continue
+
+                endpoint_match = re.search(
+                    r'fetch\s*\(\s*["\'](/api/[a-zA-Z0-9_/-]+)[^"\']*["\']\s*,\s*\{.*?method\s*:\s*["\']POST["\']',
+                    script,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+
+                if not endpoint_match:
+                    continue
+
+                endpoint = endpoint_match.group(1)
+                parts = endpoint.strip("/").split("/")
+                if len(parts) >= 2:
+                    endpoint = f"/api/{parts[1]}"
+
+                user_id_match = re.search(
+                    r'users\s*:\s*\{\s*id\s*:\s*["\']([^"\']+)',
+                    script
+                )
+
+                _hltb_search_endpoint = endpoint
+                _hltb_search_user_id = (
+                    user_id_match.group(1)
+                    if user_id_match
+                    else None
+                )
+
+                print(
+                    f"HLTB search endpoint discovered: "
+                    f"{_hltb_search_endpoint}"
+                )
+
+                return (
+                    _hltb_search_endpoint,
+                    _hltb_search_user_id
+                )
+
+        except Exception as error:
+            print(f"HLTB endpoint discovery error: {error}")
+
+    # Current known endpoint first, followed by recent historical names.
+    _hltb_search_endpoint = "/api/bleed"
+    _hltb_search_user_id = None
+
+    return _hltb_search_endpoint, None
+
+
+async def fetch_hltb_token(
+    session: aiohttp.ClientSession,
+    endpoint: str
+) -> dict:
+
+    clean_endpoint = endpoint.rstrip("/")
+
+    async with session.get(
+        f"{HLTB_BASE_URL}{clean_endpoint}/init",
+        params={"t": int(time.time())},
+        headers=hltb_headers()
+    ) as response:
+        body = await response.text()
+
+        if response.status != 200:
+            raise RuntimeError(
+                f"HLTB token endpoint {clean_endpoint}/init "
+                f"returned HTTP {response.status}: {body[:200]}"
+            )
+
+        try:
+            data = await response.json(content_type=None)
+        except Exception as error:
+            raise RuntimeError(
+                f"HLTB token response was not JSON: {body[:200]}"
+            ) from error
+
+    token = (
+        data.get("token")
+        or (data.get("data") or {}).get("token")
+        or data.get("auth_token")
+        or data.get("authToken")
+    )
+
+    auth_key = None
+    auth_value = None
+
+    for field_name, field_value in data.items():
+        lower = str(field_name).lower()
+        if "key" in lower:
+            auth_key = field_value
+        elif "val" in lower:
+            auth_value = field_value
+
+    if not token:
+        raise RuntimeError("HLTB token response did not include a token.")
+
+    return {
+        "token": token,
+        "key": auth_key,
+        "value": auth_value,
+    }
+
+
+def build_hltb_payload(
+    title: str,
+    user_id: str | None,
+    auth: dict
+) -> dict:
+
+    payload = {
+        "searchType": "games",
+        "searchTerms": title.split(),
+        "searchPage": 1,
+        "size": 20,
+        "searchOptions": {
+            "games": {
+                "userId": 0,
+                "platform": "",
+                "sortCategory": "popular",
+                "rangeCategory": "main",
+                "rangeTime": {"min": 0, "max": 0},
+                "gameplay": {
+                    "perspective": "",
+                    "flow": "",
+                    "genre": "",
+                    "difficulty": "",
+                },
+                "rangeYear": {"max": "", "min": ""},
+                "modifier": "",
+            },
+            "users": {"sortCategory": "postcount"},
+            "lists": {"sortCategory": "follows"},
+            "filter": "",
+            "sort": 0,
+            "randomizer": 0,
+        },
+        "useCache": True,
+    }
+
+    if user_id:
+        payload["searchOptions"]["users"]["id"] = user_id
+
+    if auth.get("key") and auth.get("value"):
+        payload[str(auth["key"])] = auth["value"]
+
+    return payload
+
+
+async def direct_hltb_search(title: str) -> list[dict]:
+    endpoint, user_id = await discover_hltb_search_info()
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        auth = await fetch_hltb_token(
+            session,
+            endpoint
+        )
+
+        payload = build_hltb_payload(
+            title,
+            user_id,
+            auth
+        )
+
+        async with session.post(
+            f"{HLTB_BASE_URL}{endpoint}",
+            headers=hltb_headers(auth),
+            json=payload
+        ) as response:
+            body = await response.text()
+
+            if response.status != 200:
+                raise RuntimeError(
+                    f"HLTB search endpoint {endpoint} "
+                    f"returned HTTP {response.status}: {body[:300]}"
+                )
+
+            try:
+                data = await response.json(content_type=None)
+            except Exception as error:
+                raise RuntimeError(
+                    f"HLTB search response was not JSON: {body[:300]}"
+                ) from error
+
+    results = []
+
+    for item in data.get("data") or []:
+        game_id = item.get("game_id")
+        game_image = item.get("game_image")
+
+        results.append({
+            "game_id": game_id,
+            "game_name": item.get("game_name") or "",
+            "profile_platforms": item.get("profile_platform") or "",
+            "main_story": hltb_seconds_to_hours(item.get("comp_main")),
+            "main_extra": hltb_seconds_to_hours(item.get("comp_plus")),
+            "completionist": hltb_seconds_to_hours(item.get("comp_100")),
+            "game_image_url": (
+                f"{HLTB_BASE_URL}/games/{game_image}"
+                if game_image
+                else None
+            ),
+            "game_web_link": (
+                f"{HLTB_BASE_URL}/game/{game_id}"
+                if game_id
+                else None
+            ),
+        })
+
+    return results
 
 
 # =========================================================
@@ -4590,26 +4887,13 @@ def format_hltb_platforms(platforms) -> str:
 async def howlong(interaction: discord.Interaction, game: str):
     await interaction.response.defer()
 
+    variants = expand_game_query(game)
+    search_query = variants[-1] if variants else game
+
     try:
-        merged_results = {}
-
-        for query_variant in expand_game_query(game):
-            batch = await HowLongToBeat(0.0).async_search(
-                query_variant,
-                similarity_case_sensitive=False
-            )
-
-            for entry in batch:
-                key = (
-                    getattr(entry, "game_id", None)
-                    or getattr(entry, "game_name", "")
-                )
-                merged_results[key] = entry
-
-        results = list(merged_results.values())
-
+        results = await direct_hltb_search(search_query)
     except Exception as error:
-        print(f"HowLongToBeat search error: {error}")
+        print(f"HowLongToBeat direct search error: {error}")
         await interaction.followup.send(
             "MediaDB couldn't reach HowLongToBeat right now."
         )
@@ -4625,35 +4909,38 @@ async def howlong(interaction: discord.Interaction, game: str):
         results,
         key=lambda entry: game_title_match_score(
             game,
-            getattr(entry, "game_name", "")
+            entry.get("game_name") or ""
         )
     )
 
     embed = discord.Embed(
-        title=result.game_name or game,
-        url=result.game_web_link or None,
-        description=f"\U0001f3ae **{format_hltb_platforms(result.profile_platforms)}**",
+        title=result.get("game_name") or game,
+        url=result.get("game_web_link") or None,
+        description=(
+            f"\U0001f3ae **"
+            f"{format_hltb_platforms(result.get('profile_platforms'))}**"
+        ),
         color=discord.Color.from_rgb(40, 105, 150)
     )
 
     embed.add_field(
         name="\U0001f4d6 Main Story",
-        value=f"**{format_hltb_hours(result.main_story)}**",
+        value=f"**{format_hltb_hours(result.get('main_story'))}**",
         inline=False
     )
     embed.add_field(
         name="\U00002728 Main Story + Extras",
-        value=f"**{format_hltb_hours(result.main_extra)}**",
+        value=f"**{format_hltb_hours(result.get('main_extra'))}**",
         inline=False
     )
     embed.add_field(
         name="\U0001f3c6 Completionist",
-        value=f"**{format_hltb_hours(result.completionist)}**",
+        value=f"**{format_hltb_hours(result.get('completionist'))}**",
         inline=False
     )
 
-    if result.game_image_url:
-        embed.set_thumbnail(url=result.game_image_url)
+    if result.get("game_image_url"):
+        embed.set_thumbnail(url=result["game_image_url"])
 
     embed.set_footer(text="Playtime data provided by HowLongToBeat")
 
