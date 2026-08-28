@@ -12,7 +12,7 @@ from discord import app_commands
 from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.7.3")
+print("MediaDB code version: 1.7.4")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -1787,6 +1787,81 @@ async def search_games(
     return results[:10]
 
 
+def game_upcoming_relevance_score(
+    game: dict
+) -> float:
+
+    # Upcoming games often have few or no ratings yet, so IGDB's hype and
+    # follow activity carry more weight than review score. Existing audience
+    # activity still helps established/early-access titles rise naturally.
+    hypes = int(
+        game.get("hypes")
+        or 0
+    )
+
+    follows = int(
+        game.get("follows")
+        or 0
+    )
+
+    rating_count = int(
+        game.get("rating_count")
+        or 0
+    )
+
+    total_rating_count = int(
+        game.get("total_rating_count")
+        or 0
+    )
+
+    rating = float(
+        game.get("total_rating")
+        or game.get("rating")
+        or 0
+    )
+
+    hype_signal = min(
+        (hypes ** 0.5) * 9.0,
+        120.0
+    )
+
+    follow_signal = min(
+        (follows ** 0.5) * 5.0,
+        110.0
+    )
+
+    activity_signal = min(
+        ((rating_count + total_rating_count) ** 0.5) * 3.5,
+        90.0
+    )
+
+    # Rating quality is intentionally a small bonus. A game with no reviews
+    # should not be buried simply because it has not released yet.
+    rating_signal = (
+        max(0.0, min(rating, 100.0)) * 0.12
+        if (rating_count or total_rating_count)
+        else 0.0
+    )
+
+    company_count = len(
+        game.get("involved_companies")
+        or []
+    )
+
+    company_signal = min(
+        company_count * 1.5,
+        6.0
+    )
+
+    return (
+        hype_signal
+        + follow_signal
+        + activity_signal
+        + rating_signal
+        + company_signal
+    )
+
+
 # =========================================================
 # IGDB UPCOMING
 # =========================================================
@@ -1869,6 +1944,8 @@ async def get_upcoming_games(
         "game.rating_count,"
         "game.total_rating,"
         "game.total_rating_count,"
+        "game.hypes,"
+        "game.follows,"
         "game.involved_companies.company.name,"
         "game.involved_companies.developer,"
         "game.involved_companies.publisher,"
@@ -1947,14 +2024,25 @@ async def get_upcoming_games(
         games_by_id.values()
     )
 
+    # Rank the strongest upcoming-game signals first across the selected
+    # timeframe. This keeps obscure releases available without forcing users
+    # to page through them before major or buzzy games.
     results.sort(
-        key=lambda game:
+        key=lambda game: (
+            -game_upcoming_relevance_score(
+                game
+            ),
             int(
                 game.get(
                     "_game_release_date"
                 )
                 or 0
-            )
+            ),
+            (
+                game.get("name")
+                or ""
+            ).lower(),
+        )
     )
 
     return results
@@ -2200,6 +2288,78 @@ def movie_relevance_score(
         + cast_signal
         + director_signal
         + release_bonus
+    )
+
+
+def tv_relevance_score(
+    item: dict
+) -> float:
+
+    # Country/language neutral relevance ranking for new series. Popularity,
+    # audience activity, recognizable cast, and known creators can all lift a
+    # show without excluding smaller or foreign productions.
+    popularity = float(
+        item.get("popularity")
+        or 0
+    )
+
+    vote_count = int(
+        item.get("vote_count")
+        or 0
+    )
+
+    vote_signal = min(
+        (vote_count ** 0.5) * 2.5,
+        75.0
+    )
+
+    details = (
+        item.get("_details")
+        or {}
+    )
+
+    credits = (
+        details.get("credits")
+        or {}
+    )
+
+    cast_popularities = sorted(
+        [
+            float(person.get("popularity") or 0)
+            for person in credits.get("cast", [])[:10]
+        ],
+        reverse=True
+    )
+
+    cast_signal = sum(
+        cast_popularities[:3]
+    ) * 0.45
+
+    creator_popularities = sorted(
+        [
+            float(person.get("popularity") or 0)
+            for person in details.get("created_by", [])
+        ],
+        reverse=True
+    )
+
+    creator_signal = sum(
+        creator_popularities[:2]
+    ) * 0.65
+
+    # A modest availability signal helps shows with an established U.S.
+    # distribution footprint, but it cannot overwhelm talent/popularity.
+    provider_signal = min(
+        len(get_us_provider_names(details)) * 2.0,
+        8.0
+    )
+
+    return (
+        popularity
+        + vote_signal
+        + cast_signal
+        + creator_signal
+        + provider_signal
     )
 
 
@@ -2580,18 +2740,21 @@ async def get_upcoming(
 
     else:
 
+        # Series use the same relevance-first browsing philosophy as movies:
+        # recognizable/buzzy shows first, with premiere date as a tie-breaker.
         results.sort(
             key=lambda item: (
+                -tv_relevance_score(
+                    item
+                ),
                 item.get(
                     date_field,
                     ""
                 ),
-                -float(
-                    item.get(
-                        "popularity"
-                    )
-                    or 0
-                )
+                (
+                    item.get("name")
+                    or ""
+                ).lower(),
             )
         )
 
