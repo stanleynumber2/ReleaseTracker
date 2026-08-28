@@ -12,7 +12,7 @@ from discord import app_commands
 from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.7.2")
+print("MediaDB code version: 1.7.3")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -2128,6 +2128,81 @@ async def get_us_movie_release_date(
     )
 
 
+def movie_relevance_score(
+    item: dict
+) -> float:
+
+    # This is deliberately language/country neutral. The score only tries
+    # to estimate how likely a release is to be recognizable or noteworthy.
+    popularity = float(
+        item.get("popularity")
+        or 0
+    )
+
+    vote_count = int(
+        item.get("vote_count")
+        or 0
+    )
+
+    # Vote activity is useful, but capped so an older franchise entry or
+    # unusually early rating count cannot completely dominate the list.
+    vote_signal = min(
+        (vote_count ** 0.5) * 2.5,
+        75.0
+    )
+
+    details = (
+        item.get("_details")
+        or {}
+    )
+
+    credits = (
+        details.get("credits")
+        or {}
+    )
+
+    cast_popularities = sorted(
+        [
+            float(person.get("popularity") or 0)
+            for person in credits.get("cast", [])[:10]
+        ],
+        reverse=True
+    )
+
+    cast_signal = sum(
+        cast_popularities[:3]
+    ) * 0.45
+
+    director_popularity = 0.0
+
+    for person in credits.get("crew", []):
+        if person.get("job") == "Director":
+            director_popularity = max(
+                director_popularity,
+                float(person.get("popularity") or 0)
+            )
+
+    director_signal = (
+        director_popularity * 0.65
+    )
+
+    # Wide theatrical releases get a modest boost, but limited releases can
+    # still rank highly through cast/director/popularity signals.
+    release_bonus = (
+        18.0
+        if item.get("_us_release_type") == 3
+        else 5.0
+    )
+
+    return (
+        popularity
+        + vote_signal
+        + cast_signal
+        + director_signal
+        + release_bonus
+    )
+
+
 async def verify_us_movie_release(
     item: dict,
     start_date,
@@ -2139,13 +2214,25 @@ async def verify_us_movie_release(
     if not tmdb_id:
         return None
 
-    data = await fetch_tmdb(
-        f"movie/{tmdb_id}/release_dates"
+    # Fetch details, credits, and release dates together. This keeps the
+    # relevance ranking based on TMDb data without adding another request
+    # later when the embed is opened.
+    details = await fetch_tmdb(
+        f"movie/{tmdb_id}",
+        {
+            "append_to_response":
+                "credits,watch/providers,release_dates"
+        }
+    )
+
+    release_data = (
+        details.get("release_dates")
+        or {}
     )
 
     us_entries = None
 
-    for country in data.get(
+    for country in release_data.get(
         "results",
         []
     ):
@@ -2226,8 +2313,8 @@ async def verify_us_movie_release(
         )
     )
 
-    chosen_date = (
-        possible_dates[0][1]
+    chosen_type, chosen_date = (
+        possible_dates[0]
     )
 
     verified = dict(item)
@@ -2235,6 +2322,12 @@ async def verify_us_movie_release(
     verified["release_date"] = (
         chosen_date.isoformat()
     )
+
+    verified["_us_release_type"] = (
+        chosen_type
+    )
+
+    verified["_details"] = details
 
     return verified
 
@@ -2467,20 +2560,40 @@ async def get_upcoming(
         if result is not None:
             results.append(result)
 
-    results.sort(
-        key=lambda item: (
-            item.get(
-                date_field,
-                ""
-            ),
-            -float(
+    if media_type == "movie":
+
+        # For longer movie lists, put the strongest relevance signals first
+        # across the whole selected timeframe. Date is the tie-breaker, so
+        # users can stop paging once the list becomes too obscure without
+        # burying a notable release later in the week/month.
+        results.sort(
+            key=lambda item: (
+                -movie_relevance_score(
+                    item
+                ),
                 item.get(
-                    "popularity"
+                    date_field,
+                    ""
                 )
-                or 0
             )
         )
-    )
+
+    else:
+
+        results.sort(
+            key=lambda item: (
+                item.get(
+                    date_field,
+                    ""
+                ),
+                -float(
+                    item.get(
+                        "popularity"
+                    )
+                    or 0
+                )
+            )
+        )
 
     return results
 
