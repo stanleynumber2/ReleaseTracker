@@ -12,7 +12,7 @@ from discord import app_commands
 from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.6.12")
+print("MediaDB code version: 1.7.0")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -2726,11 +2726,7 @@ async def build_upcoming_embed(
         title=title,
         url=page_url,
         description=description,
-        color=discord.Color.from_rgb(
-            40,
-            105,
-            150
-        )
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     embed.set_author(
@@ -2842,11 +2838,7 @@ async def build_game_upcoming_embed(
         title=title,
         url=game.get("url"),
         description=description,
-        color=discord.Color.from_rgb(
-            40,
-            105,
-            150
-        )
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     embed.set_author(
@@ -3009,11 +3001,7 @@ async def build_search_embed(
         title=display_title,
         url=page_url,
         description=description,
-        color=discord.Color.from_rgb(
-            40,
-            105,
-            150
-        )
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     embed.set_author(
@@ -3152,11 +3140,7 @@ async def build_game_search_embed(
         title=display_title,
         url=game.get("url"),
         description=description,
-        color=discord.Color.from_rgb(
-            40,
-            105,
-            150
-        )
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     embed.set_author(
@@ -3379,11 +3363,7 @@ async def build_countdown_embed(
         title=title,
         url=page_url,
         description=description,
-        color=discord.Color.from_rgb(
-            40,
-            105,
-            150
-        )
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     embed.set_author(
@@ -3442,11 +3422,7 @@ async def build_game_countdown_embed(
         title=title,
         url=game.get("url"),
         description=description,
-        color=discord.Color.from_rgb(
-            40,
-            105,
-            150
-        )
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     embed.set_author(
@@ -5052,7 +5028,7 @@ async def howlong(interaction: discord.Interaction, game: str):
                 description=(
                     f"\U0001f3ae **{platform_text}**"
                 ),
-                color=discord.Color.from_rgb(40, 105, 150)
+                color=discord.Color.from_rgb(240, 24, 31)
             )
 
             embed.add_field(
@@ -5114,7 +5090,7 @@ async def howlong(interaction: discord.Interaction, game: str):
             f"\U0001f3ae **{platform_text}**\n\n"
             f"\U0001f517 **[View on HowLongToBeat]({hltb_url})**"
         ),
-        color=discord.Color.from_rgb(40, 105, 150)
+        color=discord.Color.from_rgb(240, 24, 31)
     )
 
     cover_url = igdb_cover_url(
