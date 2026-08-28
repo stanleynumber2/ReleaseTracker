@@ -12,7 +12,7 @@ from discord import app_commands
 from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.7.1")
+print("MediaDB code version: 1.7.2")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -137,6 +137,75 @@ async def fetch_tmdb(
                 )
 
             return await response.json()
+
+
+async def fetch_all_tmdb_pages(
+    endpoint: str,
+    params: dict,
+    max_pages: int = 500
+) -> list[dict]:
+
+    first_page = await fetch_tmdb(
+        endpoint,
+        {
+            **params,
+            "page": 1,
+        }
+    )
+
+    results = list(
+        first_page.get("results")
+        or []
+    )
+
+    total_pages = min(
+        int(first_page.get("total_pages") or 1),
+        max_pages
+    )
+
+    if total_pages <= 1:
+        return results
+
+    # Fetch remaining pages in modest batches so a larger timeframe does not
+    # create a burst of hundreds of simultaneous TMDb requests.
+    for batch_start in range(2, total_pages + 1, 8):
+        batch_end = min(
+            batch_start + 8,
+            total_pages + 1
+        )
+
+        page_calls = [
+            fetch_tmdb(
+                endpoint,
+                {
+                    **params,
+                    "page": page_number,
+                }
+            )
+            for page_number in range(
+                batch_start,
+                batch_end
+            )
+        ]
+
+        pages = await asyncio.gather(
+            *page_calls,
+            return_exceptions=True
+        )
+
+        for page in pages:
+            if isinstance(page, Exception):
+                print(
+                    f"TMDb pagination error: {page}"
+                )
+                continue
+
+            results.extend(
+                page.get("results")
+                or []
+            )
+
+    return results
 
 
 async def get_details(
@@ -2263,12 +2332,17 @@ async def get_upcoming(
                 "false",
         }
 
+        raw_candidates = await fetch_all_tmdb_pages(
+            endpoint,
+            params
+        )
+
     else:
 
         endpoint = "discover/tv"
         date_field = "first_air_date"
 
-        params = {
+        base_params = {
             "first_air_date.gte":
                 today.isoformat(),
 
@@ -2285,17 +2359,44 @@ async def get_upcoming(
                 "false",
         }
 
-    data = await fetch_tmdb(
-        endpoint,
-        params
-    )
+        # Build the TV candidate pool from two U.S.-relevance signals:
+        # 1) shows originating in the U.S.;
+        # 2) shows with watch-provider availability in the U.S.
+        # This avoids paging through the entire worldwide TV catalog.
+        us_origin_results, us_watch_results = await asyncio.gather(
+            fetch_all_tmdb_pages(
+                endpoint,
+                {
+                    **base_params,
+                    "with_origin_country": "US",
+                }
+            ),
+            fetch_all_tmdb_pages(
+                endpoint,
+                {
+                    **base_params,
+                    "watch_region": "US",
+                    "with_watch_monetization_types":
+                        "flatrate|free|ads",
+                }
+            )
+        )
 
-    candidates = []
+        raw_candidates = (
+            us_origin_results
+            + us_watch_results
+        )
 
-    for item in data.get(
-        "results",
-        []
-    ):
+    # Deduplicate across pages (and, for TV, across the two U.S. candidate
+    # queries) before doing the more expensive verification calls.
+    candidates_by_id = {}
+
+    for item in raw_candidates:
+
+        item_id = item.get("id")
+
+        if not item_id:
+            continue
 
         date_string = item.get(
             date_field
@@ -2305,12 +2406,10 @@ async def get_upcoming(
             continue
 
         try:
-
             item_date = datetime.strptime(
                 date_string,
                 "%Y-%m-%d"
             ).date()
-
         except ValueError:
             continue
 
@@ -2319,8 +2418,11 @@ async def get_upcoming(
             <= item_date
             <= end_date
         ):
+            candidates_by_id[item_id] = item
 
-            candidates.append(item)
+    candidates = list(
+        candidates_by_id.values()
+    )
 
     if media_type == "movie":
 
