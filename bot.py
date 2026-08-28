@@ -12,7 +12,7 @@ from discord import app_commands
 from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.7.0")
+print("MediaDB code version: 1.7.1")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -1732,7 +1732,9 @@ async def get_upcoming_games(
     ).date()
 
     days = (
-        7
+        0
+        if timeframe == "today"
+        else 7
         if timeframe == "week"
         else 30
     )
@@ -2225,7 +2227,9 @@ async def get_upcoming(
     ).date()
 
     days = (
-        7
+        0
+        if timeframe == "today"
+        else 7
         if timeframe == "week"
         else 30
     )
@@ -4037,7 +4041,7 @@ class GameSearchBrowser(
 )
 @app_commands.describe(
     media_type="Choose Movie, Game, or Series.",
-    timeframe="Choose week or month.",
+    timeframe="Choose a timeframe.",
     platform="Optional game platform. Start typing to search platforms."
 )
 @app_commands.rename(
@@ -4047,6 +4051,10 @@ class GameSearchBrowser(
 @app_commands.choices(
     media_type=TYPE_CHOICES,
     timeframe=[
+        app_commands.Choice(
+            name="Today",
+            value="today"
+        ),
         app_commands.Choice(
             name="Week",
             value="week"
@@ -4113,7 +4121,9 @@ async def upcoming(
         if not results:
 
             period = (
-                "the next 7 days"
+                "today"
+                if timeframe.value == "today"
+                else "the next 7 days"
                 if timeframe.value == "week"
                 else "the next 30 days"
             )
@@ -4183,9 +4193,16 @@ async def upcoming(
 
     if not results:
 
+        period = (
+            "today"
+            if timeframe.value == "today"
+            else "in the next 7 days"
+            if timeframe.value == "week"
+            else "in the next 30 days"
+        )
+
         await interaction.followup.send(
-            "No releases were found "
-            "for that period."
+            f"No releases were found {period}."
         )
 
         return
