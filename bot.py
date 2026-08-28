@@ -9,9 +9,10 @@ from urllib.parse import quote_plus
 import aiohttp
 import discord
 from discord import app_commands
+from howlongtobeatpy import HowLongToBeat
 
 
-print("MediaDB code version: 1.6.10")
+print("MediaDB code version: 1.6.12")
 
 # 1.6.8 is based on the known-good 1.6.3 command/data logic.
 # The only intended feature change is local platform autocomplete.
@@ -1563,20 +1564,75 @@ def get_game_release_timestamp(
 
     else:
 
-        first_release = game.get(
-            "first_release_date"
-        )
+        # With no platform selected, platform is truly optional:
+        # for future-release checks, consider every known platform
+        # release and choose the earliest one that has not passed.
+        if future_only:
 
-        if first_release:
-
-            if (
-                not future_only
-                or int(first_release) >= now
+            for release in (
+                game.get("release_dates")
+                or []
             ):
 
+                timestamp = release.get(
+                    "date"
+                )
+
+                if not timestamp:
+                    continue
+
+                if int(timestamp) < now:
+                    continue
+
+                possible_dates.append(
+                    int(timestamp)
+                )
+
+            # Some IGDB records may not expose release_dates even
+            # though first_release_date is available, so keep it as
+            # a fallback.
+            if not possible_dates:
+
+                first_release = game.get(
+                    "first_release_date"
+                )
+
+                if (
+                    first_release
+                    and int(first_release) >= now
+                ):
+
+                    possible_dates.append(
+                        int(first_release)
+                    )
+
+        else:
+
+            first_release = game.get(
+                "first_release_date"
+            )
+
+            if first_release:
                 possible_dates.append(
                     int(first_release)
                 )
+
+            # Fallback for unusual records without first_release_date.
+            if not possible_dates:
+
+                for release in (
+                    game.get("release_dates")
+                    or []
+                ):
+
+                    timestamp = release.get(
+                        "date"
+                    )
+
+                    if timestamp:
+                        possible_dates.append(
+                            int(timestamp)
+                        )
 
     if not possible_dates:
         return None
@@ -4924,14 +4980,17 @@ async def direct_hltb_search(title: str) -> list[dict]:
 
 @client.tree.command(
     name="howlong",
-    description="Open a game's HowLongToBeat page."
+    description="See how long a game takes to beat."
 )
 @app_commands.describe(game="Game title to search for.")
 async def howlong(interaction: discord.Interaction, game: str):
     await interaction.response.defer()
 
+    # Resolve the user's wording through IGDB first. This preserves MediaDB's
+    # tolerant matching for shorthand such as "ff7 remake" without making
+    # multiple requests to HowLongToBeat.
     try:
-        results = await search_games(game)
+        igdb_results = await search_games(game)
     except Exception as error:
         print(f"IGDB /howlong title lookup error: {error}")
         await interaction.followup.send(
@@ -4939,13 +4998,13 @@ async def howlong(interaction: discord.Interaction, game: str):
         )
         return
 
-    if not results:
+    if not igdb_results:
         await interaction.followup.send(
             f"No relevant game result was found for **{game}**."
         )
         return
 
-    resolved_game = results[0]
+    resolved_game = igdb_results[0]
     resolved_title = resolved_game.get("name") or game
 
     hltb_url = (
@@ -4953,9 +5012,102 @@ async def howlong(interaction: discord.Interaction, game: str):
         f"{quote_plus(resolved_title)}"
     )
 
+    # Primary path: current howlongtobeatpy wrapper. One request only.
+    hltb_results = None
+
+    try:
+        hltb_results = await HowLongToBeat().async_search(
+            resolved_title
+        )
+    except Exception as error:
+        print(f"HowLongToBeat wrapper search error: {error}")
+
+    if hltb_results:
+        try:
+            best = max(
+                hltb_results,
+                key=lambda entry: game_title_match_score(
+                    resolved_title,
+                    getattr(entry, "game_name", "")
+                )
+            )
+
+            best_name = (
+                getattr(best, "game_name", None)
+                or resolved_title
+            )
+
+            best_link = (
+                getattr(best, "game_web_link", None)
+                or hltb_url
+            )
+
+            platform_text = format_hltb_platforms(
+                getattr(best, "profile_platforms", None)
+            )
+
+            embed = discord.Embed(
+                title=best_name,
+                url=best_link,
+                description=(
+                    f"\U0001f3ae **{platform_text}**"
+                ),
+                color=discord.Color.from_rgb(40, 105, 150)
+            )
+
+            embed.add_field(
+                name="\U0001f4d6 Main Story",
+                value=(
+                    f"**{format_hltb_hours(getattr(best, 'main_story', None))}**"
+                ),
+                inline=False
+            )
+
+            embed.add_field(
+                name="\U00002728 Main Story + Extras",
+                value=(
+                    f"**{format_hltb_hours(getattr(best, 'main_extra', None))}**"
+                ),
+                inline=False
+            )
+
+            embed.add_field(
+                name="\U0001f3c6 Completionist",
+                value=(
+                    f"**{format_hltb_hours(getattr(best, 'completionist', None))}**"
+                ),
+                inline=False
+            )
+
+            image_url = getattr(best, "game_image_url", None)
+
+            if image_url:
+                embed.set_thumbnail(url=image_url)
+            else:
+                cover_url = igdb_cover_url(
+                    resolved_game,
+                    thumbnail=True
+                )
+                if cover_url:
+                    embed.set_thumbnail(url=cover_url)
+
+            embed.set_footer(
+                text="Playtime data provided by HowLongToBeat"
+            )
+
+            await interaction.followup.send(embed=embed)
+            return
+
+        except Exception as error:
+            # If a future wrapper change alters its result object, the command
+            # still remains useful through the safe browser-link fallback.
+            print(f"HowLongToBeat result formatting error: {error}")
+
+    # Fallback path: no HLTB API call. IGDB resolves the game and the user
+    # receives a normal human-facing HLTB search link.
     platform_text = format_game_platforms(resolved_game)
 
-    embed = discord.Embed(
+    fallback_embed = discord.Embed(
         title=resolved_title,
         url=hltb_url,
         description=(
@@ -4971,13 +5123,13 @@ async def howlong(interaction: discord.Interaction, game: str):
     )
 
     if cover_url:
-        embed.set_thumbnail(url=cover_url)
+        fallback_embed.set_thumbnail(url=cover_url)
 
-    embed.set_footer(
-        text="Game title provided by IGDB"
+    fallback_embed.set_footer(
+        text="HowLongToBeat lookup unavailable â browser link provided"
     )
 
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=fallback_embed)
 
 
 client.run(DISCORD_TOKEN)
